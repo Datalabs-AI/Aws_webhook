@@ -24,14 +24,18 @@ import traceback
 load_dotenv()
 
 # --- CONFIG ---
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
-REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to us-east-1 if not set
+# Use exact Coolify variable names
+AWS_ACCESS_KEY = os.getenv("aws_access_key_id")
+AWS_SECRET_KEY = os.getenv("aws_secret_access_key")
+REGION = os.getenv("AWS_REGION_NAME", "us-east-1")  # Default to us-east-1 if not set
 PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 def get_s3_client():
     """Get S3 client, creating it if needed."""
+    if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
+        raise ValueError(f"AWS credentials not configured. AWS_ACCESS_KEY={'set' if AWS_ACCESS_KEY else 'missing'}, AWS_SECRET_KEY={'set' if AWS_SECRET_KEY else 'missing'}")
+    
     return boto3.client(
         "s3",
         aws_access_key_id=AWS_ACCESS_KEY,
@@ -225,6 +229,10 @@ async def extract_bank_metadata(data: S3Input):
         # Step 1️⃣: Download PDF
         global S3
         if S3 is None:
+            # Debug: Check if credentials are available
+            print(f"[{request_id}] AWS_ACCESS_KEY present: {bool(AWS_ACCESS_KEY)}")
+            print(f"[{request_id}] AWS_SECRET_KEY present: {bool(AWS_SECRET_KEY)}")
+            print(f"[{request_id}] AWS_REGION: {REGION}")
             S3 = get_s3_client()
             
         try:
