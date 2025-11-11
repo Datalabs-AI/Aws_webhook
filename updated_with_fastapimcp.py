@@ -24,21 +24,31 @@ load_dotenv()
 # --- CONFIG ---
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
-REGION = os.getenv("AWS_REGION")
+REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to us-east-1 if not set
 PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-S3 = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=REGION
-)
+def get_s3_client():
+    """Get S3 client, creating it if needed."""
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=REGION
+    )
+
+S3 = None  # Will be initialized on first use
 
 PPLX_URL = "https://api.perplexity.ai/chat/completions"
 HEADERS = {"Authorization": f"Bearer {PPLX_API_KEY}", "Content-Type": "application/json"}
 
-OPENAI_CLIENT = openai.OpenAI(api_key=OPENAI_API_KEY)
+def get_openai_client():
+    """Get OpenAI client, creating it if needed."""
+    if not OPENAI_API_KEY:
+        return None
+    return openai.OpenAI(api_key=OPENAI_API_KEY)
+
+OPENAI_CLIENT = None  # Will be initialized on first use
 
 app = FastAPI(title="Hybrid Metadata Extractor")
 
@@ -72,6 +82,10 @@ def _derive_tenant_and_paths_from_key(s3_key: str):
 
 async def _append_metadata_to_s3_json(bucket: str, metadata_key: str, document_id: str, document_metadata: dict):
     """Read existing metadata.json, append or upsert this document's metadata, and write back."""
+    global S3
+    if S3 is None:
+        S3 = get_s3_client()
+    
     existing = {}
     try:
         # Download existing metadata.json if present
@@ -126,6 +140,12 @@ def _convert_pdf_to_image(pdf_bytes: bytes) -> Image.Image:
 
 async def call_openai_vision(image: Image.Image, system_prompt: str) -> dict:
     """Send image + prompt to OpenAI GPT-4o Vision."""
+    global OPENAI_CLIENT
+    if OPENAI_CLIENT is None:
+        OPENAI_CLIENT = get_openai_client()
+        if OPENAI_CLIENT is None:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+    
     try:
         # Convert PIL Image to base64
         buffer = BytesIO()
@@ -201,6 +221,10 @@ async def extract_bank_metadata(data: S3Input):
 
     try:
         # Step 1️⃣: Download PDF
+        global S3
+        if S3 is None:
+            S3 = get_s3_client()
+            
         try:
             pdf_stream = io.BytesIO()
             # Run S3 download in thread pool since it's blocking I/O
