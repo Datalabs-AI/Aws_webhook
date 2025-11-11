@@ -16,6 +16,8 @@ import time
 import asyncio
 import aiohttp
 from datetime import datetime
+import sys
+import traceback
 
 
 
@@ -338,9 +340,37 @@ async def extract_bank_metadata(data: S3Input):
             "timing": total_time,
         }
 
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
     except Exception as e:
         error_time = time.time() - start_time
-        print(f"[{request_id}] ❌ Failed after {error_time:.2f}s: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        error_traceback = traceback.format_exc()
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        
+        # Get comprehensive error information
+        error_type = type(e).__name__
+        error_msg = str(e) if str(e) else repr(e)
+        
+        # If error message is empty, try to get more info
+        if not error_msg or error_msg.strip() == "":
+            error_msg = f"{error_type}: {repr(e)}"
+            if hasattr(e, 'args') and e.args:
+                error_msg += f" (args: {e.args})"
+        
+        # Print detailed error information
+        print(f"[{request_id}] ❌ Failed after {error_time:.2f}s")
+        print(f"[{request_id}] Exception Type: {error_type}")
+        print(f"[{request_id}] Error Message: {error_msg}")
+        print(f"[{request_id}] Full traceback:\n{error_traceback}")
+        
+        # Also print exception args if available
+        if hasattr(e, 'args') and e.args:
+            print(f"[{request_id}] Exception args: {e.args}")
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Processing failed: {error_type} - {error_msg}"
+        )
 
     
