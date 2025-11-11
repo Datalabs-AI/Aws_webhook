@@ -27,6 +27,7 @@ load_dotenv()
 # Use exact Coolify variable names (reads from .env via load_dotenv() or environment)
 AWS_ACCESS_KEY = os.getenv("aws_access_key_id")
 AWS_SECRET_KEY = os.getenv("aws_secret_access_key")
+AWS_REGION_NAME = os.getenv("AWS_REGION_NAME", "us-east-1")
 PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -39,7 +40,7 @@ def get_s3_client():
         "s3",
         aws_access_key_id=AWS_ACCESS_KEY,
         aws_secret_access_key=AWS_SECRET_KEY,
-        region_name=os.getenv("AWS_REGION_NAME", "us-east-1")
+        region_name=AWS_REGION_NAME
     )
 
 S3 = None  # Will be initialized on first use
@@ -231,7 +232,7 @@ async def extract_bank_metadata(data: S3Input):
             # Debug: Check if credentials are available
             print(f"[{request_id}] AWS_ACCESS_KEY present: {bool(AWS_ACCESS_KEY)}")
             print(f"[{request_id}] AWS_SECRET_KEY present: {bool(AWS_SECRET_KEY)}")
-            print(f"[{request_id}] AWS_REGION: {os.getenv('AWS_REGION_NAME', 'us-east-1')}")
+            print(f"[{request_id}] AWS_REGION: {AWS_REGION_NAME}")
             S3 = get_s3_client()
             
         try:
