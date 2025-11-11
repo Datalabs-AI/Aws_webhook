@@ -28,6 +28,28 @@ REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to us-east-1 if not set
 PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Validate required environment variables
+def validate_env():
+    """Validate that all required environment variables are set."""
+    missing = []
+    if not AWS_ACCESS_KEY:
+        missing.append("AWS_ACCESS_KEY")
+    if not AWS_SECRET_KEY:
+        missing.append("AWS_SECRET_KEY")
+    if not PPLX_API_KEY:
+        missing.append("PPLX_API_KEY")
+    if not OPENAI_API_KEY:
+        missing.append("OPENAI_API_KEY")
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+
+# Validate on startup
+try:
+    validate_env()
+    print("✅ All required environment variables are set")
+except ValueError as e:
+    print(f"⚠️  WARNING: {e}")
+
 def get_s3_client():
     """Get S3 client, creating it if needed."""
     return boto3.client(
@@ -51,6 +73,15 @@ def get_openai_client():
 OPENAI_CLIENT = None  # Will be initialized on first use
 
 app = FastAPI(title="Hybrid Metadata Extractor")
+
+@app.on_event("startup")
+async def startup_event():
+    """Validate environment on startup."""
+    try:
+        validate_env()
+        print("✅ Application startup: All environment variables validated")
+    except ValueError as e:
+        print(f"⚠️  WARNING: {e}")
 
 
 # --- MODELS ---
@@ -338,9 +369,16 @@ async def extract_bank_metadata(data: S3Input):
             "timing": total_time,
         }
 
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
     except Exception as e:
         error_time = time.time() - start_time
-        print(f"[{request_id}] ❌ Failed after {error_time:.2f}s: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        import traceback
+        error_traceback = traceback.format_exc()
+        error_msg = str(e) if str(e) else repr(e)
+        print(f"[{request_id}] ❌ Failed after {error_time:.2f}s: {error_msg}")
+        print(f"[{request_id}] Full traceback:\n{error_traceback}")
+        raise HTTPException(status_code=500, detail=f"Processing failed: {error_msg}\nTraceback: {error_traceback}")
 
     
