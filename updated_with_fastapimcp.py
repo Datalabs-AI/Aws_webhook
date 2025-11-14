@@ -128,38 +128,43 @@ async def _append_metadata_to_s3_json(bucket: str, metadata_key: str, document_i
         Body=body,
         ContentType="application/json",
     )
-async def pdf_to_first_page_image(pdf_bytes: bytes) -> Image.Image:
-    """Convert the first page of PDF to PIL image."""
-    # Run in thread pool since it's blocking I/O
-    return await asyncio.to_thread(_convert_pdf_to_image, pdf_bytes)
-
-
-def _convert_pdf_to_image(pdf_bytes: bytes) -> Image.Image:
-    """Convert the first page of PDF to PIL image (blocking version)."""
+def pdf_to_first_two_page_images(pdf_bytes: bytes) -> list:
+    """Convert the first and second pages of PDF to PIL images (blocking)."""
     pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = pdf.load_page(0)
-    pix = page.get_pixmap(dpi=200)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    images = []
+    for i in range(min(2, pdf.page_count)):
+        page = pdf.load_page(i)
+        pix = page.get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
     pdf.close()
-    return img
+    return images
 
+async def pdf_to_first_two_page_images_async(pdf_bytes: bytes) -> list:
+    """Async: Convert first two PDF pages to PIL Images."""
+    return await asyncio.to_thread(pdf_to_first_two_page_images, pdf_bytes)
 
-async def call_openai_vision(image: Image.Image, system_prompt: str) -> dict:
-    """Send image + prompt to OpenAI GPT-4o Vision."""
+async def call_openai_vision(images: list, system_prompt: str) -> dict:
+    """Send images + prompt to OpenAI GPT-4o Vision."""
     global OPENAI_CLIENT
     if OPENAI_CLIENT is None:
         OPENAI_CLIENT = get_openai_client()
         if OPENAI_CLIENT is None:
             raise HTTPException(status_code=500, detail="OpenAI API key not configured")
-    
+
     try:
-        # Convert PIL Image to base64
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        image_bytes = buffer.getvalue()
-        base64_image = base64.b64encode(image_bytes).decode("utf-8")
-        
-        # Call OpenAI Vision API (run in thread pool since it's blocking I/O)
+        image_entries = []
+        for image in images:
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            image_bytes = buffer.getvalue()
+            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            image_entries.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+            })
+        image_entries.append({"type": "text", "text": "Analyze this bank statement and extract the metadata."})
+
         response = await asyncio.to_thread(
             OPENAI_CLIENT.chat.completions.create,
             model="gpt-4o",
@@ -167,22 +172,14 @@ async def call_openai_vision(image: Image.Image, system_prompt: str) -> dict:
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_image}"
-                            }
-                        },
-                        {"type": "text", "text": "Analyze this bank statement and extract the metadata."}
-                    ]
+                    "content": image_entries
                 }
             ]
         )
-        
         raw_text = response.choices[0].message.content.strip()
         if raw_text.startswith("```json"):
-            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+            raw_text = raw_text.split("```json")[1].split("```")
+            raw_text = raw_text[0].strip() if raw_text else raw_text.strip()
         return json.loads(raw_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI Vision API failed: {str(e)}")
@@ -246,11 +243,11 @@ async def extract_bank_metadata(data: S3Input):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error downloading PDF: {str(e)}")
 
-        # Step 2️⃣: Convert first page → image
+        # Step 2️⃣: Convert first and second pages → images
         conversion_start = time.time()
-        image = await pdf_to_first_page_image(pdf_bytes)
+        images = await pdf_to_first_two_page_images_async(pdf_bytes)
         conversion_time = time.time() - conversion_start
-        print(f"[{request_id}] Converted PDF to image in {conversion_time:.2f}s")
+        print(f"[{request_id}] Converted PDF to images in {conversion_time:.2f}s")
 
         # Step 3️⃣: OpenAI GPT-4o Vision → Extract core metadata
         system_prompt_1 = (
@@ -284,7 +281,7 @@ async def extract_bank_metadata(data: S3Input):
 )
 
         openai_start = time.time()
-        openai_result = await call_openai_vision(image, system_prompt_1)
+        openai_result = await call_openai_vision(images, system_prompt_1)
         openai_time = time.time() - openai_start
         print(f"[{request_id}] OpenAI Vision completed in {openai_time:.2f}s")
         print(f"[{request_id}] OpenAI Output:", openai_result)
