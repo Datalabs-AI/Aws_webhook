@@ -16,29 +16,45 @@ import time
 import asyncio
 import aiohttp
 from datetime import datetime
+import sys
+import traceback
 
 
 
 load_dotenv()
 
 # --- CONFIG ---
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY")
-REGION = os.getenv("AWS_REGION")
+# Use exact Coolify variable names (reads from .env via load_dotenv() or environment)
+AWS_ACCESS_KEY = os.getenv("aws_access_key_id")
+AWS_SECRET_KEY = os.getenv("aws_secret_access_key")
+AWS_REGION_NAME = os.getenv("AWS_REGION_NAME", "us-east-1")
 PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-S3 = boto3.client(
-    "s3",
-    aws_access_key_id=AWS_ACCESS_KEY,
-    aws_secret_access_key=AWS_SECRET_KEY,
-    region_name=REGION
-)
+def get_s3_client():
+    """Get S3 client, creating it if needed."""
+    if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
+        raise ValueError(f"AWS credentials not configured. AWS_ACCESS_KEY={'set' if AWS_ACCESS_KEY else 'missing'}, AWS_SECRET_KEY={'set' if AWS_SECRET_KEY else 'missing'}")
+    
+    return boto3.client(
+        "s3",
+        aws_access_key_id=AWS_ACCESS_KEY,
+        aws_secret_access_key=AWS_SECRET_KEY,
+        region_name=AWS_REGION_NAME
+    )
+
+S3 = None  # Will be initialized on first use
 
 PPLX_URL = "https://api.perplexity.ai/chat/completions"
 HEADERS = {"Authorization": f"Bearer {PPLX_API_KEY}", "Content-Type": "application/json"}
 
-OPENAI_CLIENT = openai.OpenAI(api_key=OPENAI_API_KEY)
+def get_openai_client():
+    """Get OpenAI client, creating it if needed."""
+    if not OPENAI_API_KEY:
+        return None
+    return openai.OpenAI(api_key=OPENAI_API_KEY)
+
+OPENAI_CLIENT = None  # Will be initialized on first use
 
 app = FastAPI(title="Hybrid Metadata Extractor")
 
@@ -72,6 +88,10 @@ def _derive_tenant_and_paths_from_key(s3_key: str):
 
 async def _append_metadata_to_s3_json(bucket: str, metadata_key: str, document_id: str, document_metadata: dict):
     """Read existing metadata.json, append or upsert this document's metadata, and write back."""
+    global S3
+    if S3 is None:
+        S3 = get_s3_client()
+    
     existing = {}
     try:
         # Download existing metadata.json if present
@@ -108,32 +128,43 @@ async def _append_metadata_to_s3_json(bucket: str, metadata_key: str, document_i
         Body=body,
         ContentType="application/json",
     )
-async def pdf_to_first_page_image(pdf_bytes: bytes) -> Image.Image:
-    """Convert the first page of PDF to PIL image."""
-    # Run in thread pool since it's blocking I/O
-    return await asyncio.to_thread(_convert_pdf_to_image, pdf_bytes)
-
-
-def _convert_pdf_to_image(pdf_bytes: bytes) -> Image.Image:
-    """Convert the first page of PDF to PIL image (blocking version)."""
+def pdf_to_first_two_page_images(pdf_bytes: bytes) -> list:
+    """Convert the first four pages of PDF to PIL images (blocking)."""
     pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = pdf.load_page(0)
-    pix = page.get_pixmap(dpi=200)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+    images = []
+    for i in range(min(4, pdf.page_count)):
+        page = pdf.load_page(i)
+        pix = page.get_pixmap(dpi=200)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        images.append(img)
     pdf.close()
-    return img
+    return images
 
+async def pdf_to_first_two_page_images_async(pdf_bytes: bytes) -> list:
+    """Async: Convert first two PDF pages to PIL Images."""
+    return await asyncio.to_thread(pdf_to_first_two_page_images, pdf_bytes)
 
-async def call_openai_vision(image: Image.Image, system_prompt: str) -> dict:
-    """Send image + prompt to OpenAI GPT-4o Vision."""
+async def call_openai_vision(images: list, system_prompt: str) -> dict:
+    """Send images + prompt to OpenAI GPT-4o Vision."""
+    global OPENAI_CLIENT
+    if OPENAI_CLIENT is None:
+        OPENAI_CLIENT = get_openai_client()
+        if OPENAI_CLIENT is None:
+            raise HTTPException(status_code=500, detail="OpenAI API key not configured")
+
     try:
-        # Convert PIL Image to base64
-        buffer = BytesIO()
-        image.save(buffer, format="PNG")
-        image_bytes = buffer.getvalue()
-        base64_image = base64.b64encode(image_bytes).decode("utf-8")
-        
-        # Call OpenAI Vision API (run in thread pool since it's blocking I/O)
+        image_entries = []
+        for image in images:
+            buffer = BytesIO()
+            image.save(buffer, format="PNG")
+            image_bytes = buffer.getvalue()
+            base64_image = base64.b64encode(image_bytes).decode("utf-8")
+            image_entries.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64_image}"}
+            })
+        image_entries.append({"type": "text", "text": "Analyze this bank statement and extract the metadata."})
+
         response = await asyncio.to_thread(
             OPENAI_CLIENT.chat.completions.create,
             model="gpt-4o",
@@ -141,22 +172,14 @@ async def call_openai_vision(image: Image.Image, system_prompt: str) -> dict:
                 {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/png;base64,{base64_image}"
-                            }
-                        },
-                        {"type": "text", "text": "Analyze this bank statement and extract the metadata."}
-                    ]
+                    "content": image_entries
                 }
             ]
         )
-        
         raw_text = response.choices[0].message.content.strip()
         if raw_text.startswith("```json"):
-            raw_text = raw_text.split("```json")[1].split("```")[0].strip()
+            raw_text = raw_text.split("```json")[1].split("```")
+            raw_text = raw_text[0].strip() if raw_text else raw_text.strip()
         return json.loads(raw_text)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI Vision API failed: {str(e)}")
@@ -201,6 +224,14 @@ async def extract_bank_metadata(data: S3Input):
 
     try:
         # Step 1️⃣: Download PDF
+        global S3
+        if S3 is None:
+            # Debug: Check if credentials are available
+            print(f"[{request_id}] AWS_ACCESS_KEY present: {bool(AWS_ACCESS_KEY)}")
+            print(f"[{request_id}] AWS_SECRET_KEY present: {bool(AWS_SECRET_KEY)}")
+            print(f"[{request_id}] AWS_REGION: {AWS_REGION_NAME}")
+            S3 = get_s3_client()
+            
         try:
             pdf_stream = io.BytesIO()
             # Run S3 download in thread pool since it's blocking I/O
@@ -212,11 +243,11 @@ async def extract_bank_metadata(data: S3Input):
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Error downloading PDF: {str(e)}")
 
-        # Step 2️⃣: Convert first page → image
+        # Step 2️⃣: Convert first and second pages → images
         conversion_start = time.time()
-        image = await pdf_to_first_page_image(pdf_bytes)
+        images = await pdf_to_first_two_page_images_async(pdf_bytes)
         conversion_time = time.time() - conversion_start
-        print(f"[{request_id}] Converted PDF to image in {conversion_time:.2f}s")
+        print(f"[{request_id}] Converted PDF to images in {conversion_time:.2f}s")
 
         # Step 3️⃣: OpenAI GPT-4o Vision → Extract core metadata
         system_prompt_1 = (
@@ -250,7 +281,7 @@ async def extract_bank_metadata(data: S3Input):
 )
 
         openai_start = time.time()
-        openai_result = await call_openai_vision(image, system_prompt_1)
+        openai_result = await call_openai_vision(images, system_prompt_1)
         openai_time = time.time() - openai_start
         print(f"[{request_id}] OpenAI Vision completed in {openai_time:.2f}s")
         print(f"[{request_id}] OpenAI Output:", openai_result)
@@ -314,9 +345,37 @@ async def extract_bank_metadata(data: S3Input):
             "timing": total_time,
         }
 
+    except HTTPException:
+        # Re-raise HTTPExceptions as-is
+        raise
     except Exception as e:
         error_time = time.time() - start_time
-        print(f"[{request_id}] ❌ Failed after {error_time:.2f}s: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
+        error_traceback = traceback.format_exc()
+        exc_type, exc_value, exc_tb = sys.exc_info()
+        
+        # Get comprehensive error information
+        error_type = type(e).__name__
+        error_msg = str(e) if str(e) else repr(e)
+        
+        # If error message is empty, try to get more info
+        if not error_msg or error_msg.strip() == "":
+            error_msg = f"{error_type}: {repr(e)}"
+            if hasattr(e, 'args') and e.args:
+                error_msg += f" (args: {e.args})"
+        
+        # Print detailed error information
+        print(f"[{request_id}] ❌ Failed after {error_time:.2f}s")
+        print(f"[{request_id}] Exception Type: {error_type}")
+        print(f"[{request_id}] Error Message: {error_msg}")
+        print(f"[{request_id}] Full traceback:\n{error_traceback}")
+        
+        # Also print exception args if available
+        if hasattr(e, 'args') and e.args:
+            print(f"[{request_id}] Exception args: {e.args}")
+        
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Processing failed: {error_type} - {error_msg}"
+        )
 
     
