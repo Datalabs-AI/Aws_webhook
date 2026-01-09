@@ -129,10 +129,10 @@ async def _append_metadata_to_s3_json(bucket: str, metadata_key: str, document_i
         ContentType="application/json",
     )
 def pdf_to_first_two_page_images(pdf_bytes: bytes) -> list:
-    """Convert the first and second pages of PDF to PIL images (blocking)."""
+    """Convert the first four pages of PDF to PIL images (blocking)."""
     pdf = fitz.open(stream=pdf_bytes, filetype="pdf")
     images = []
-    for i in range(min(2, pdf.page_count)):
+    for i in range(min(4, pdf.page_count)):
         page = pdf.load_page(i)
         pix = page.get_pixmap(dpi=200)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
